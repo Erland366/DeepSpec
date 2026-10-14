@@ -1,6 +1,7 @@
 import time
 from typing import Optional
 
+import torch
 from torch.utils.tensorboard import SummaryWriter
 
 from deepspec.utils import ensure_dir, is_global_main_process, print_on_global_main
@@ -12,6 +13,9 @@ _wandb_run = None
 _logging_steps: int = 1
 _session_start_wall: Optional[float] = None
 _session_start_step: int = 0
+_window_start_wall: Optional[float] = None
+_window_start_step: int = 0
+_window_tokens = None
 
 
 def init(
@@ -42,6 +46,20 @@ def start_session(*, global_step: int) -> None:
     reset()
     _session_start_wall = time.time()
     _session_start_step = int(global_step)
+    _start_window(global_step=global_step)
+
+
+def _start_window(*, global_step: int) -> None:
+    global _window_start_wall, _window_start_step, _window_tokens
+    _window_start_wall = time.time()
+    _window_start_step = int(global_step)
+    _window_tokens = None
+
+
+def add_tokens(num_tokens) -> None:
+    """Count this rank's processed sequence tokens (kept on device; read once per logging window)."""
+    global _window_tokens
+    _window_tokens = num_tokens if _window_tokens is None else _window_tokens + num_tokens
 
 
 def on_optimizer_step(
@@ -59,7 +77,15 @@ def on_optimizer_step(
     if global_step % _logging_steps != 0:
         return None
 
+    elapsed = time.time() - _window_start_wall
+    window_steps = max(int(global_step) - _window_start_step, 1)
+    tokens = 0.0 if _window_tokens is None else float(_window_tokens)
+    add_metric("tokens_per_s_per_gpu", tokens / elapsed, reduction="dp_mean", tag="perf")
+    add_metric("step_time_s", elapsed / window_steps, reduction="dp_max", tag="perf")
+    add_metric("max_mem_allocated_gib", torch.cuda.max_memory_allocated() / 2**30, reduction="dp_max", tag="perf")
+    add_metric("max_mem_reserved_gib", torch.cuda.max_memory_reserved() / 2**30, reduction="dp_max", tag="perf")
     summary = flush()
+    _start_window(global_step=global_step)
     if is_global_main_process():
         _write_scalars(summary, global_step=global_step)
         _print_summary(

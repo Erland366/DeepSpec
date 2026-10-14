@@ -382,6 +382,7 @@ class BaseTrainer:
                 )
                 sync_context = nullcontext() if should_sync else self.model.no_sync()
                 with sync_context:
+                    training_logger.add_tokens(batch["attention_mask"].sum())
                     loss = self.run_batch(batch) / self.gradient_accumulation_steps
                     loss.backward()
                 self.next_micro_step += 1
