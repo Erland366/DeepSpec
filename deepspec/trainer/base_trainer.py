@@ -2,6 +2,7 @@ from contextlib import nullcontext
 import json
 import math
 import os
+import time
 
 import torch
 import torch.distributed as dist
@@ -177,6 +178,48 @@ def _resolve_round(*, round_cfg, steps_per_epoch: int, max_train_steps: int, dat
     return resolved
 
 
+def _resolve_rounds(*, rounds_cfg, max_train_steps):
+    """train.rounds = [{cache_dirs, start_step, stop_step, sampler_epoch, num_samples}, ...]: one launch trains the
+    rounds in order, each on its own cache (a chunk group that is shipped in while earlier rounds train and deleted
+    after its round-NNNN.done marker). Rounds must tile [0, max_train_steps) exactly."""
+    if rounds_cfg is None:
+        return None
+    assert max_train_steps is not None, "train.rounds needs train.max_train_steps (the whole-run total)"
+    rounds = []
+    for cfg in rounds_cfg:
+        cache_dirs = cfg["cache_dirs"]
+        cache_dirs = [str(d) for d in cache_dirs] if isinstance(cache_dirs, (list, tuple)) else [str(cache_dirs)]
+        rounds.append(dict({key: int(cfg[key]) for key in ("start_step", "stop_step", "sampler_epoch", "num_samples")},
+                           cache_dirs=cache_dirs))
+    assert rounds, "train.rounds is empty"
+    expected_start = 0
+    for index, rnd in enumerate(rounds):
+        assert rnd["start_step"] == expected_start and rnd["stop_step"] > rnd["start_step"], (
+            f"train.rounds[{index}] must start at {expected_start} and be non-empty: {rnd}"
+        )
+        expected_start = rnd["stop_step"]
+    assert expected_start == int(max_train_steps), (
+        f"train.rounds end at step {expected_start}, max_train_steps is {max_train_steps}"
+    )
+    return rounds
+
+
+def _wait_for_cache_dirs(cache_dirs, *, timeout_s: float, poll_s: float = 30.0):
+    """Block until every cache dir has its manifest (chunks are published by an atomic rename); fail after timeout."""
+    start = time.time()
+    last_report = 0.0
+    while True:
+        missing = [d for d in cache_dirs if not os.path.isfile(os.path.join(d, "manifest.json"))]
+        if not missing:
+            return time.time() - start
+        waited = time.time() - start
+        assert waited < timeout_s, f"cache dirs still missing after {waited:.0f} s: {missing}"
+        if waited - last_report >= 300 or last_report == 0.0:
+            print_on_global_main(f"Waiting for {len(missing)} cache dir(s), e.g. {missing[0]} ({waited:.0f} s)")
+            last_report = max(waited, 1e-9)
+        time.sleep(poll_s)
+
+
 class BaseTrainer:
     data_collator_cls = None
 
@@ -225,37 +268,32 @@ class BaseTrainer:
             self.model = torch.compile(self.model, dynamic=True)
         self.model = self._wrap_with_fsdp(self.model)
 
-        # target_cache_path: one cache dir, or a list of chunk dirs read as one cache in list order.
-        self.train_dataset = build_cache_dataset(self.args.data.target_cache_path)
-        validate_train_cache(
-            train_dataset=self.train_dataset,
-            draft_model=self.draft_model,
-            target_model_name_or_path=self.args.model.target_model_name_or_path,
-        )
-
-        (
-            self.gradient_accumulation_steps,
-            self.samples_per_epoch,
-            self.per_rank_samples_per_epoch,
-            self.micro_batches_per_epoch,
-            self.steps_per_epoch,
-            self.max_train_steps,
-            self.args.train.num_train_epochs,
-        ) = _compute_training_schedule(
-            world_size=self.world_size,
-            dataset_size=len(self.train_dataset),
-            local_batch_size=int(self.args.train.local_batch_size),
-            global_batch_size=int(self.args.train.global_batch_size),
-            num_train_epochs=int(self.args.train.num_train_epochs),
+        self.rounds = _resolve_rounds(
+            rounds_cfg=self.args.train.get("rounds"),
             max_train_steps=self.args.train.max_train_steps,
         )
-
-        self.round = _resolve_round(
-            round_cfg=self.args.train.get("round"),
-            steps_per_epoch=self.steps_per_epoch,
-            max_train_steps=self.max_train_steps,
-            dataset_size=len(self.train_dataset),
-        )
+        self._last_saved_step = None
+        if self.rounds is None:
+            # target_cache_path: one cache dir, or a list of chunk dirs read as one cache in list order.
+            self.train_dataset = build_cache_dataset(self.args.data.target_cache_path)
+            validate_train_cache(
+                train_dataset=self.train_dataset,
+                draft_model=self.draft_model,
+                target_model_name_or_path=self.args.model.target_model_name_or_path,
+            )
+            self._set_schedule(dataset_size=len(self.train_dataset))
+            self.round = _resolve_round(
+                round_cfg=self.args.train.get("round"),
+                steps_per_epoch=self.steps_per_epoch,
+                max_train_steps=self.max_train_steps,
+                dataset_size=len(self.train_dataset),
+            )
+        else:
+            assert self.args.train.get("round") is None, "set train.round or train.rounds, not both"
+            # Caches arrive while training runs; schedule fields follow the active round (planned sizes until then).
+            self.train_dataset = None
+            self.round = None
+            self._set_schedule(dataset_size=self.rounds[0]["num_samples"])
 
         self.optimizer = BF16Optimizer(
             self.draft_model,
@@ -284,13 +322,74 @@ class BaseTrainer:
             )
         self.info_board()
 
+    def _set_schedule(self, *, dataset_size: int):
+        (
+            self.gradient_accumulation_steps,
+            self.samples_per_epoch,
+            self.per_rank_samples_per_epoch,
+            self.micro_batches_per_epoch,
+            self.steps_per_epoch,
+            self.max_train_steps,
+            self.args.train.num_train_epochs,
+        ) = _compute_training_schedule(
+            world_size=self.world_size,
+            dataset_size=int(dataset_size),
+            local_batch_size=int(self.args.train.local_batch_size),
+            global_batch_size=int(self.args.train.global_batch_size),
+            num_train_epochs=int(self.args.train.num_train_epochs),
+            max_train_steps=self.args.train.max_train_steps,
+        )
+
+    def _activate_round(self, index: int, rnd):
+        waited = _wait_for_cache_dirs(
+            rnd["cache_dirs"], timeout_s=float(self.args.data.get("round_wait_timeout_s", 6 * 3600))
+        )
+        dist.barrier()
+        dataset = build_cache_dataset(rnd["cache_dirs"] if len(rnd["cache_dirs"]) > 1 else rnd["cache_dirs"][0])
+        validate_train_cache(
+            train_dataset=dataset,
+            draft_model=self.draft_model,
+            target_model_name_or_path=self.args.model.target_model_name_or_path,
+        )
+        self.train_dataset = dataset
+        self._set_schedule(dataset_size=len(dataset))
+        self.round = _resolve_round(
+            round_cfg=rnd,
+            steps_per_epoch=self.steps_per_epoch,
+            max_train_steps=self.max_train_steps,
+            dataset_size=len(dataset),
+        )
+        assert self.global_step >= self.round["start_step"], (
+            f"round {index} starts at step {self.round['start_step']} but training is at step {self.global_step}"
+        )
+        print_on_global_main(
+            f"Round {index}/{len(self.rounds)}: steps [{self.round['start_step']}, {self.round['stop_step']}) "
+            f"from step {self.global_step}, {len(dataset)} samples in {len(rnd['cache_dirs'])} dir(s), "
+            f"sampler_epoch {self.round['sampler_epoch']}, waited {waited:.0f} s for data"
+        )
+
+    def _finish_round(self, index: int, rnd):
+        self.train_dataset.close()
+        self.train_dataset = None
+        if is_global_main_process():
+            marker_dir = os.path.join(self.checkpoint_dir_root, "rounds")
+            ensure_dir(marker_dir)
+            marker = os.path.join(marker_dir, f"round-{index:04d}.done")
+            with open(marker + ".tmp", "w", encoding="utf-8") as handle:
+                json.dump({"round": index, "global_step": self.global_step, "cache_dirs": rnd["cache_dirs"]}, handle)
+            os.replace(marker + ".tmp", marker)
+        dist.barrier()
+
     @property
     def global_step(self):
         return self.next_micro_step // self.gradient_accumulation_steps
 
     def info_board(self):
         print_on_local_main("***** Running training *****")
-        print_on_local_main(f"  Train dataset size = {len(self.train_dataset)}")
+        if self.train_dataset is not None:
+            print_on_local_main(f"  Train dataset size = {len(self.train_dataset)}")
+        else:
+            print_on_local_main(f"  Rounds = {len(self.rounds)} (caches arrive during training)")
         print_on_local_main(f"  Num train epochs = {self.args.train.num_train_epochs}")
         print_on_local_main(f"  Samples per epoch = {self.samples_per_epoch}")
         print_on_local_main(f"  Local batch size = {self.args.train.local_batch_size}")
@@ -385,6 +484,7 @@ class BaseTrainer:
 
     def save_and_eval_checkpoint(self):
         checkpoint_dir = save_checkpoint(**self._checkpoint_kwargs())
+        self._last_saved_step = self.global_step
         if is_global_main_process():
             _launch_eval(
                 target_model_name_or_path=self.args.model.target_model_name_or_path,
@@ -406,11 +506,25 @@ class BaseTrainer:
         dist.barrier()
 
     def train(self):
+        if self.rounds is None:
+            self._train_round()
+            return
+        for index, rnd in enumerate(self.rounds):
+            if self.global_step >= rnd["stop_step"]:
+                continue
+            self._activate_round(index, rnd)
+            if not self._train_round():
+                self.train_dataset.close()  # suspended mid-round: no done marker; a relaunch resumes this round
+                return
+            self._finish_round(index, rnd)
+
+    def _train_round(self):
+        """Train up to the stop step; False if suspended before reaching it."""
         self.model.train()
         stop_step = self.max_train_steps if self.round is None else self.round["stop_step"]
         if self.global_step >= stop_step:
             print_on_global_main(f"Nothing to do: global step {self.global_step} >= stop step {stop_step}.")
-            return
+            return True
 
         local_batch_size = int(self.args.train.local_batch_size)
         total_micro_steps = stop_step * self.gradient_accumulation_steps
@@ -468,9 +582,12 @@ class BaseTrainer:
 
                 if self.suspend_controller.requested():
                     self._save_and_suspend()
-                    return
+                    return False
 
-        self.save_and_eval_checkpoint()
+        del prefetcher, dataloader
+        if self._last_saved_step != self.global_step:
+            self.save_and_eval_checkpoint()
+        return True
 
     def clean_up(self):
         training_logger.close()
