@@ -154,19 +154,24 @@ def _launch_eval(
     else:
         print("You can use this function to launch your auto eval script!")
 
-def _resolve_round(*, round_cfg, steps_per_epoch: int, max_train_steps: int):
-    """train.round = {start_step, stop_step, sampler_epoch}: train only global steps [start_step, stop_step) on this
-    launch's cache (a chunk group), with the LR schedule of the whole run (train.max_train_steps = total over all
-    rounds). One round is at most one pass over its cache; sampler_epoch picks the cache's shuffle (seed + epoch)."""
+def _resolve_round(*, round_cfg, steps_per_epoch: int, max_train_steps: int, dataset_size: int):
+    """train.round = {start_step, stop_step, sampler_epoch, num_samples}: train only global steps
+    [start_step, stop_step) on this launch's cache (a chunk group), with the LR schedule of the whole run
+    (train.max_train_steps = total over all rounds). The round makes whole passes over its cache, the first with the
+    cache's epoch-`sampler_epoch` shuffle (seed + epoch), the next with sampler_epoch + 1, and so on; num_samples
+    must equal the cache size the round was planned for."""
     if round_cfg is None:
         return None
-    resolved = {key: int(round_cfg[key]) for key in ("start_step", "stop_step", "sampler_epoch")}
+    resolved = {key: int(round_cfg[key]) for key in ("start_step", "stop_step", "sampler_epoch", "num_samples")}
     assert 0 <= resolved["start_step"] < resolved["stop_step"] <= int(max_train_steps), (
         f"train.round must satisfy 0 <= start_step < stop_step <= max_train_steps={max_train_steps}: {resolved}"
     )
-    assert resolved["stop_step"] - resolved["start_step"] <= int(steps_per_epoch), (
-        f"train.round spans {resolved['stop_step'] - resolved['start_step']} steps but its cache gives only "
-        f"{steps_per_epoch} steps per pass: {resolved}"
+    assert resolved["num_samples"] == int(dataset_size), (
+        f"train.round was planned for {resolved['num_samples']} samples but the cache has {dataset_size}: {resolved}"
+    )
+    assert (resolved["stop_step"] - resolved["start_step"]) % int(steps_per_epoch) == 0, (
+        f"train.round spans {resolved['stop_step'] - resolved['start_step']} steps, not whole passes of "
+        f"{steps_per_epoch} steps over its cache: {resolved}"
     )
     assert resolved["sampler_epoch"] >= 0
     return resolved
@@ -249,6 +254,7 @@ class BaseTrainer:
             round_cfg=self.args.train.get("round"),
             steps_per_epoch=self.steps_per_epoch,
             max_train_steps=self.max_train_steps,
+            dataset_size=len(self.train_dataset),
         )
 
         self.optimizer = BF16Optimizer(
