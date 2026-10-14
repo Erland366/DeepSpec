@@ -11,7 +11,7 @@ from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
 from torch.utils.data import DataLoader
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
-from deepspec.data import CacheDataset, validate_train_cache
+from deepspec.data import build_cache_dataset, validate_train_cache
 from deepspec.data.cuda_prefetcher import CUDAPrefetcher
 from deepspec.utils import (
     BF16Optimizer,
@@ -201,7 +201,8 @@ class BaseTrainer:
             self.model = torch.compile(self.model, dynamic=True)
         self.model = self._wrap_with_fsdp(self.model)
 
-        self.train_dataset = CacheDataset(cache_dir=self.args.data.target_cache_path)
+        # target_cache_path: one cache dir, or a list of chunk dirs read as one cache in list order.
+        self.train_dataset = build_cache_dataset(self.args.data.target_cache_path)
         validate_train_cache(
             train_dataset=self.train_dataset,
             draft_model=self.draft_model,

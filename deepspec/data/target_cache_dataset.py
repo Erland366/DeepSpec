@@ -1,5 +1,6 @@
 """Target-cache storage protocol, writers, dataset, collator, and validation."""
 
+import bisect
 import json
 import mmap
 import os
@@ -24,6 +25,14 @@ INDEX_RECORD_SIZE = INDEX_RECORD_STRUCT.size
 TARGET_CACHE_HIDDEN_DTYPE = "bfloat16"
 TARGET_CACHE_TOKEN_DTYPE  = "int32"
 TARGET_CACHE_MASK_DTYPE   = "uint8"
+
+# A cache whose manifest sets has_target_last_hidden_states=false stores no last-layer states (e.g. hidden states
+# extracted by vLLM, which only exposes the tapped layers); its index records carry this offset sentinel instead.
+TARGET_CACHE_ABSENT_OFFSET = 2**64 - 1
+
+
+def target_cache_has_last_hidden_states(manifest) -> bool:
+    return bool(manifest.get("has_target_last_hidden_states", True))
 
 
 def atomic_json_dump(payload, path: str):
@@ -621,6 +630,7 @@ class CacheDataset(torch.utils.data.Dataset):
         self.hidden_size = int(self.manifest["hidden_size"])
         self.target_layer_ids = [int(layer_id) for layer_id in self.manifest["target_layer_ids"]]
         self.num_target_layers = len(self.target_layer_ids)
+        self.has_target_last_hidden_states = target_cache_has_last_hidden_states(self.manifest)
         self.index_path = os.path.join(self.cache_dir, "samples.idx")
         self.index_file = None
         self.index_mmap = None
@@ -784,18 +794,86 @@ class CacheDataset(torch.utils.data.Dataset):
             shape=(seq_len, self.num_target_layers * self.hidden_size),
             nbytes=nbytes["target_hidden_states"],
         )
-        target_last_hidden_states = self._read_bfloat16_tensor_from_shard(
-            shard_mmap=shard_mmap,
-            offset=record["target_last_hidden_states_offset"],
-            shape=(seq_len, self.hidden_size),
-            nbytes=nbytes["target_last_hidden_states"],
-        )
-        return {
+        sample = {
             "input_ids": input_ids,
             "loss_mask": loss_mask,
             "target_hidden_states": target_hidden_states,
-            "target_last_hidden_states": target_last_hidden_states,
         }
+        if self.has_target_last_hidden_states:
+            sample["target_last_hidden_states"] = self._read_bfloat16_tensor_from_shard(
+                shard_mmap=shard_mmap,
+                offset=record["target_last_hidden_states_offset"],
+                shape=(seq_len, self.hidden_size),
+                nbytes=nbytes["target_last_hidden_states"],
+            )
+        else:
+            assert int(record["target_last_hidden_states_offset"]) == TARGET_CACHE_ABSENT_OFFSET, (
+                "Cache manifest says target_last_hidden_states are absent but the index record has an offset: "
+                f"{self.cache_dir} sample {index}"
+            )
+        return sample
+
+
+_CACHE_CONCAT_MATCH_FIELDS = (
+    "target_layer_ids",
+    "hidden_size",
+    "target_model_name_or_path",
+    "has_target_last_hidden_states",
+)
+
+
+class ConcatCacheDataset(torch.utils.data.Dataset):
+    """Several target-cache dirs read as one cache: global index i walks the dirs in the given order.
+
+    Training over [chunk-000, chunk-001, ...] is identical (same sampler permutation, same batches) to training
+    over one cache holding the same samples in that order. All dirs must agree on the fields that define the cache.
+    """
+
+    def __init__(self, cache_dirs, max_open_shards: int = 4):
+        super().__init__()
+        cache_dirs = [str(cache_dir) for cache_dir in cache_dirs]
+        assert cache_dirs, "ConcatCacheDataset needs at least one cache dir."
+        self.datasets = [CacheDataset(cache_dir, max_open_shards=max_open_shards) for cache_dir in cache_dirs]
+        first = self.datasets[0].manifest
+        for dataset in self.datasets[1:]:
+            for field in _CACHE_CONCAT_MATCH_FIELDS:
+                assert dataset.manifest.get(field) == first.get(field), (
+                    f"Target cache dirs disagree on {field}: {self.datasets[0].cache_dir}={first.get(field)!r} "
+                    f"vs {dataset.cache_dir}={dataset.manifest.get(field)!r}"
+                )
+        self.cumulative_sizes = []
+        total = 0
+        for dataset in self.datasets:
+            total += len(dataset)
+            self.cumulative_sizes.append(total)
+        self.num_samples = total
+        self.manifest = dict(first)
+        self.manifest["num_samples"] = total
+        self.manifest["cache_dirs"] = [dataset.cache_dir for dataset in self.datasets]
+        self.manifest["cache_dir_num_samples"] = [len(dataset) for dataset in self.datasets]
+        self.has_target_last_hidden_states = self.datasets[0].has_target_last_hidden_states
+
+    def __len__(self):
+        return self.num_samples
+
+    def __getitem__(self, index: int):
+        index = int(index)
+        if not (0 <= index < self.num_samples):
+            raise IndexError(index)
+        dataset_idx = bisect.bisect_right(self.cumulative_sizes, index)
+        start = self.cumulative_sizes[dataset_idx - 1] if dataset_idx > 0 else 0
+        return self.datasets[dataset_idx][index - start]
+
+    def close(self):
+        for dataset in self.datasets:
+            dataset.close()
+
+
+def build_cache_dataset(target_cache_path):
+    """One cache dir (str) -> CacheDataset; a list/tuple of dirs -> ConcatCacheDataset in list order."""
+    if isinstance(target_cache_path, (list, tuple)):
+        return ConcatCacheDataset(list(target_cache_path))
+    return CacheDataset(cache_dir=target_cache_path)
 
 
 def _pad_1d_batch(features: List[Dict], key: str):
@@ -866,5 +944,8 @@ class CacheCollator:
             attention_mask[i, : item["input_ids"].shape[0]] = 1
         batch["attention_mask"] = attention_mask
         for key in ("target_hidden_states", "target_last_hidden_states"):
-            batch[key] = _pad_hidden_batch(features, key)
+            present = [key in item for item in features]
+            assert all(present) or not any(present), f"{key} is present in only some samples of a batch."
+            if all(present):
+                batch[key] = _pad_hidden_batch(features, key)
         return batch

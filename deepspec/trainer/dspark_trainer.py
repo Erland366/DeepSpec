@@ -27,7 +27,9 @@ class Qwen3DSparkTrainer(BaseTrainer):
             input_ids=batch["input_ids"],
             target_hidden_states=batch["target_hidden_states"],
             loss_mask=batch["loss_mask"],
-            target_last_hidden_states=batch["target_last_hidden_states"],
+            # Absent for caches without last-layer states (vLLM extraction); the loss then needs
+            # l1_loss_alpha == 0 and no confidence head, and skips the target-agreement metrics.
+            target_last_hidden_states=batch.get("target_last_hidden_states"),
         )
         loss = compute_dspark_loss(
             outputs=outputs,
