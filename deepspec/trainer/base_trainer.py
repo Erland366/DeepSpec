@@ -1,4 +1,5 @@
 from contextlib import nullcontext
+import json
 import math
 import os
 
@@ -28,6 +29,7 @@ from deepspec.trainer.ckpt_manager import (
     save_checkpoint,
 )
 import deepspec.utils.training_logger as training_logger
+from deepspec.utils.config import CustomJSONEncoder
 from deepspec.utils.hfai_suspend import SuspendController
 
 
@@ -170,6 +172,10 @@ class BaseTrainer:
         training_logger.init(
             logging_steps=int(self.args.logging.logging_steps),
             tensorboard_dir=self.args.logging.tensorboard_dir,
+            wandb_project=self.args.logging.get("wandb_project"),
+            wandb_entity=self.args.logging.get("wandb_entity"),
+            wandb_name=self.args.logging.get("wandb_name"),
+            config=json.loads(json.dumps(self.args, cls=CustomJSONEncoder)),
         )
 
         self.draft_model, self.tokenizer = self.build_models()

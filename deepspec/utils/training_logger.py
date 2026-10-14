@@ -8,17 +8,33 @@ from deepspec.utils.metrics import add_metric, flush, reset
 
 
 _writer: Optional[SummaryWriter] = None
+_wandb_run = None
 _logging_steps: int = 1
 _session_start_wall: Optional[float] = None
 _session_start_step: int = 0
 
 
-def init(*, logging_steps: int, tensorboard_dir: Optional[str] = None) -> None:
-    global _writer, _logging_steps
+def init(
+    *,
+    logging_steps: int,
+    tensorboard_dir: Optional[str] = None,
+    wandb_project: Optional[str] = None,
+    wandb_entity: Optional[str] = None,
+    wandb_name: Optional[str] = None,
+    config: Optional[dict] = None,
+) -> None:
+    global _writer, _logging_steps, _wandb_run
     _logging_steps = int(logging_steps)
     if tensorboard_dir is not None and is_global_main_process():
         ensure_dir(tensorboard_dir)
         _writer = SummaryWriter(tensorboard_dir)
+    if wandb_project is not None and is_global_main_process():
+        # Requested W&B logging must not silently degrade: a missing package or login fails here, before training.
+        import wandb
+
+        if not wandb.login(anonymous="never", verify=True):
+            raise RuntimeError("W&B logging requested (logging.wandb_project) but this node is not logged in")
+        _wandb_run = wandb.init(project=wandb_project, entity=wandb_entity, name=wandb_name, config=config)
 
 
 def start_session(*, global_step: int) -> None:
@@ -58,16 +74,27 @@ def on_optimizer_step(
 
 def close() -> None:
     global _writer
+    global _wandb_run
     if _writer is not None:
         _writer.close()
         _writer = None
+    if _wandb_run is not None:
+        _wandb_run.finish()
+        _wandb_run = None
 
 
 def _write_scalars(summary, *, global_step: int) -> None:
+    _write_wandb(summary, global_step=global_step)
     if _writer is None:
         return
     for key, value in summary.items():
         _writer.add_scalar(key, value, global_step)
+
+
+def _write_wandb(summary, *, global_step: int) -> None:
+    if _wandb_run is None:
+        return
+    _wandb_run.log(dict(summary), step=global_step)
 
 
 def _print_summary(
