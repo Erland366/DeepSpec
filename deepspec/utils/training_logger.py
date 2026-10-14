@@ -25,6 +25,7 @@ def init(
     wandb_project: Optional[str] = None,
     wandb_entity: Optional[str] = None,
     wandb_name: Optional[str] = None,
+    wandb_id: Optional[str] = None,
     config: Optional[dict] = None,
 ) -> None:
     global _writer, _logging_steps, _wandb_run
@@ -38,7 +39,11 @@ def init(
 
         if not wandb.login(anonymous="never", verify=True):
             raise RuntimeError("W&B logging requested (logging.wandb_project) but this node is not logged in")
-        _wandb_run = wandb.init(project=wandb_project, entity=wandb_entity, name=wandb_name, config=config)
+        # wandb_id: one W&B run shared by several launches (chunk rounds), resumed in place; steps stay global.
+        resume_kwargs = dict(id=str(wandb_id), resume="allow") if wandb_id else {}
+        _wandb_run = wandb.init(
+            project=wandb_project, entity=wandb_entity, name=wandb_name, config=config, **resume_kwargs
+        )
 
 
 def start_session(*, global_step: int) -> None:

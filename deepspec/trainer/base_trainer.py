@@ -154,6 +154,24 @@ def _launch_eval(
     else:
         print("You can use this function to launch your auto eval script!")
 
+def _resolve_round(*, round_cfg, steps_per_epoch: int, max_train_steps: int):
+    """train.round = {start_step, stop_step, sampler_epoch}: train only global steps [start_step, stop_step) on this
+    launch's cache (a chunk group), with the LR schedule of the whole run (train.max_train_steps = total over all
+    rounds). One round is at most one pass over its cache; sampler_epoch picks the cache's shuffle (seed + epoch)."""
+    if round_cfg is None:
+        return None
+    resolved = {key: int(round_cfg[key]) for key in ("start_step", "stop_step", "sampler_epoch")}
+    assert 0 <= resolved["start_step"] < resolved["stop_step"] <= int(max_train_steps), (
+        f"train.round must satisfy 0 <= start_step < stop_step <= max_train_steps={max_train_steps}: {resolved}"
+    )
+    assert resolved["stop_step"] - resolved["start_step"] <= int(steps_per_epoch), (
+        f"train.round spans {resolved['stop_step'] - resolved['start_step']} steps but its cache gives only "
+        f"{steps_per_epoch} steps per pass: {resolved}"
+    )
+    assert resolved["sampler_epoch"] >= 0
+    return resolved
+
+
 class BaseTrainer:
     data_collator_cls = None
 
@@ -175,6 +193,7 @@ class BaseTrainer:
             wandb_project=self.args.logging.get("wandb_project"),
             wandb_entity=self.args.logging.get("wandb_entity"),
             wandb_name=self.args.logging.get("wandb_name"),
+            wandb_id=self.args.logging.get("wandb_id"),
             config=json.loads(json.dumps(self.args, cls=CustomJSONEncoder)),
         )
 
@@ -226,6 +245,12 @@ class BaseTrainer:
             max_train_steps=self.args.train.max_train_steps,
         )
 
+        self.round = _resolve_round(
+            round_cfg=self.args.train.get("round"),
+            steps_per_epoch=self.steps_per_epoch,
+            max_train_steps=self.max_train_steps,
+        )
+
         self.optimizer = BF16Optimizer(
             self.draft_model,
             lr=float(self.args.train.lr),
@@ -246,6 +271,11 @@ class BaseTrainer:
             self.next_micro_step = resume_state.next_micro_step
         else:
             print_on_local_main("Training from scratch.")
+        if self.round is not None:
+            assert self.global_step >= self.round["start_step"], (
+                f"Round starts at step {self.round['start_step']} but the latest checkpoint in "
+                f"{self.checkpoint_dir_root} is at step {self.global_step}; run the earlier rounds first."
+            )
         self.info_board()
 
     @property
@@ -262,6 +292,8 @@ class BaseTrainer:
         print_on_local_main(f"  Gradient accumulation steps = {self.gradient_accumulation_steps}")
         print_on_local_main(f"  Steps per epoch = {self.steps_per_epoch}")
         print_on_local_main(f"  Max train steps = {self.max_train_steps}")
+        if self.round is not None:
+            print_on_local_main(f"  Round = {self.round}")
 
     def build_models(self):
         model_args = self.args.model
@@ -369,16 +401,28 @@ class BaseTrainer:
 
     def train(self):
         self.model.train()
-        if self.global_step >= self.max_train_steps:
+        stop_step = self.max_train_steps if self.round is None else self.round["stop_step"]
+        if self.global_step >= stop_step:
+            print_on_global_main(f"Nothing to do: global step {self.global_step} >= stop step {stop_step}.")
             return
 
         local_batch_size = int(self.args.train.local_batch_size)
-        total_micro_steps = self.max_train_steps * self.gradient_accumulation_steps
+        total_micro_steps = stop_step * self.gradient_accumulation_steps
         remaining_micro_steps = total_micro_steps - self.next_micro_step
         remaining_samples = remaining_micro_steps * local_batch_size
+        if self.round is None:
+            start_offset_samples = self.next_micro_step * local_batch_size
+        else:
+            # Position inside this round's cache: the round's sampler epoch (its shuffle seed) plus progress since
+            # the round started, so a resumed round continues where it stopped.
+            round_start_micro_step = self.round["start_step"] * self.gradient_accumulation_steps
+            start_offset_samples = (
+                self.round["sampler_epoch"] * self.per_rank_samples_per_epoch
+                + (self.next_micro_step - round_start_micro_step) * local_batch_size
+            )
 
         dataloader = self._build_train_dataloader(
-            start_offset_samples=self.next_micro_step * local_batch_size,
+            start_offset_samples=start_offset_samples,
             num_samples=remaining_samples,
         )
         prefetcher = CUDAPrefetcher(dataloader, self.device)
