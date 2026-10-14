@@ -189,6 +189,14 @@ class BaseTrainer:
             )
         self.model = self.draft_model
         if self.args.train.torch_compile:
+            coalesce = self.args.train.get("inductor_coalesce_tiling_analysis")
+            if coalesce is not None:
+                # torch 2.11 (ROCm image) inductor asserts in tiling_utils.get_pw_red_splits on this model with
+                # coalescing analysis on; the config sets this False explicitly instead of a hidden env default.
+                import torch._inductor.config as inductor_config
+
+                inductor_config.triton.coalesce_tiling_analysis = bool(coalesce)
+                print_on_local_main(f"inductor coalesce_tiling_analysis = {bool(coalesce)}")
             print_on_local_main("Compiling training model with torch.compile...")
             self.model = torch.compile(self.model, dynamic=True)
         self.model = self._wrap_with_fsdp(self.model)

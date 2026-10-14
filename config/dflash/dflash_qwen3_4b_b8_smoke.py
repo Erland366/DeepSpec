@@ -38,6 +38,8 @@ train = dict(
     max_grad_norm=1.0,
     sharding_strategy="no_shard",
     torch_compile=True,
+    # ROCm fallback: torch 2.11 inductor asserts (tiling_utils.get_pw_red_splits) with coalescing analysis on.
+    inductor_coalesce_tiling_analysis=False,
 )
 
 logging = dict(
