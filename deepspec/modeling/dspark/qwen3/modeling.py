@@ -246,6 +246,9 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.block_size = int(config.block_size)
         self.mask_token_id = config.mask_token_id
+        # Supervised slots per block: all B (anchor layout) or the B-1 mask slots (mask layout; see config.py).
+        self.first_slot = 1 if getattr(config, "label_layout", "anchor") == "mask" else 0
+        self.num_slots = self.block_size - self.first_slot
         self.num_anchors = int(config.num_anchors)
 
         # Markov head.
@@ -427,9 +430,11 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
         )
 
         num_blocks = anchor_positions.size(1)
-        output_hidden_4d = output_hidden.reshape(bsz, num_blocks, self.block_size, -1)
+        output_hidden_4d = output_hidden.reshape(bsz, num_blocks, self.block_size, -1)[
+            :, :, self.first_slot :
+        ]
 
-        label_offsets = torch.arange(1, self.block_size + 1, device=device).view(
+        label_offsets = torch.arange(1, self.num_slots + 1, device=device).view(
             1, 1, -1
         )
         label_indices = anchor_positions.unsqueeze(-1) + label_offsets
@@ -479,12 +484,7 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
             [anchor_token_ids.unsqueeze(-1), target_ids[:, :, :-1]],
             dim=-1,
         )
-        draft_logits = self.compute_logits(output_hidden).reshape(
-            bsz,
-            num_blocks,
-            self.block_size,
-            -1,
-        )
+        draft_logits = self.compute_logits(output_hidden_4d)
         if self.markov_head is not None:
             draft_logits = self.markov_head.apply_block_logits(
                 draft_logits,
@@ -497,7 +497,7 @@ class Qwen3DSparkModel(Qwen3PreTrainedModel):
             loss_mask=loss_mask,
             eval_mask=eval_mask,
             block_keep_mask=block_keep_mask,
-            block_size=self.block_size,
+            block_size=self.num_slots,
             num_anchors=self.num_anchors,
         )
 

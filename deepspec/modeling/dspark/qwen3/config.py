@@ -50,6 +50,12 @@ def build_draft_config(
         draft_config.confidence_head_with_markov = bool(
             model_args.confidence_head_with_markov
         )
+    # "anchor" (DeepSpec): slot k of a block predicts token anchor+1+k, as vLLM's V2-only `dspark` method reads it.
+    # "mask" (z-lab DFlash): slots 1..B-1 predict tokens anchor+1..anchor+B-1, as vLLM's `dflash` method reads it.
+    label_layout = str(model_args.get("label_layout", "anchor"))
+    assert label_layout in ("anchor", "mask"), f"label_layout must be 'anchor' or 'mask', got {label_layout}"
+    assert label_layout == "anchor" or markov_rank == 0, "label_layout 'mask' supports markov_rank 0 only"
+    draft_config.label_layout = label_layout
     draft_config.markov_rank = markov_rank
     if markov_rank > 0:
         draft_config.markov_head_type = str(model_args.markov_head_type)
