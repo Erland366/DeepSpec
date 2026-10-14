@@ -38,7 +38,9 @@ train = dict(
     max_train_steps=200,
     max_grad_norm=1.0,
     sharding_strategy="no_shard",
-    torch_compile=True,
+    # Whole-model torch.compile stalls 8-GPU FSDP on ROCm (one rank recompiles while the others wait in a
+    # collective; 2026-10-14). Eager model + transformers-compiled flex_attention: no stall, ~0.7 s/step on 8 GPUs.
+    torch_compile=False,
     # ROCm fallback: torch 2.11 inductor asserts (tiling_utils.get_pw_red_splits) with coalescing analysis on.
     inductor_coalesce_tiling_analysis=False,
 )
