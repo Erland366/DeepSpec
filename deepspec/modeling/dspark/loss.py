@@ -142,6 +142,14 @@ def _collect_local_terms(
             accept_rate_3d=accept_rate_3d,
             valid_block_weights=valid_block_weights,
         )
+        # Hard-label stats against the data tokens; unlike accept_rate they need no target logits. top1 is the draft's
+        # greedy pick; tau_greedy (1 + accepted prefix) is the tokens per step greedy verification would accept.
+        top1_correct = (draft_logits.argmax(dim=-1) == target_ids) & eval_mask
+        pos_top1_sums = top1_correct.to(torch.float32).sum(dim=(0, 1))
+        tau_greedy_sum = (
+            (top1_correct.to(torch.int32).cumprod(dim=-1).sum(dim=-1).to(torch.float32) + 1.0)
+            * valid_block_weights
+        ).sum()
 
     has_confidence = outputs.confidence_pred is not None
     confidence_loss_num = zero
@@ -196,6 +204,19 @@ def _collect_local_terms(
             den=pos_total_counts[pos_idx],
             tag="train",
         )
+    for pos_idx in range(block_size):
+        add_metric(
+            f"top1_acc@{pos_idx}",
+            pos_top1_sums[pos_idx],
+            den=pos_total_counts[pos_idx],
+            tag="train",
+        )
+    add_metric(
+        "tau_greedy",
+        tau_greedy_sum,
+        den=accept_block_count,
+        tag="train",
+    )
     add_metric(
         "tau_probabilistic",
         tau_prob_sum,
