@@ -25,6 +25,7 @@ from deepspec.utils import (
 )
 from deepspec.trainer.ckpt_manager import (
     discover_latest_checkpoint,
+    load_init_draft_model,
     load_resume_draft_model,
     load_training_state,
     save_checkpoint,
@@ -254,6 +255,21 @@ class BaseTrainer:
                 precision_dtype=self.precision_dtype,
                 global_rank=self.global_rank,
             )
+        init_from = self.args.train.get("init_from")
+        if init_from and self.resume_checkpoint_dir is None:
+            # Warm start: weights only; optimizer, LR schedule, step and sampler start fresh for this run.
+            self.draft_model = load_init_draft_model(
+                init_checkpoint_dir=str(init_from),
+                draft_model=self.draft_model,
+                device=self.device,
+                precision_dtype=self.precision_dtype,
+            )
+            print_on_local_main(f"Initialised draft weights from {init_from} (weights only; fresh optimizer and step).")
+        elif init_from:
+            print_on_local_main(
+                f"train.init_from={init_from} ignored: resuming this run from its own checkpoint "
+                f"{self.resume_checkpoint_dir}."
+            )
         self.model = self.draft_model
         if self.args.train.torch_compile:
             coalesce = self.args.train.get("inductor_coalesce_tiling_analysis")
@@ -313,6 +329,8 @@ class BaseTrainer:
                 micro_batches_per_epoch=self.micro_batches_per_epoch,
             )
             self.next_micro_step = resume_state.next_micro_step
+        elif init_from:
+            print_on_local_main(f"Training step 0 of a new run from the weights of {init_from}.")
         else:
             print_on_local_main("Training from scratch.")
         if self.round is not None:

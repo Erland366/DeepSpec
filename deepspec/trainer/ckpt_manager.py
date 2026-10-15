@@ -61,6 +61,48 @@ class TrainingResumeState:
     next_micro_step: int
 
 
+# Config keys that may differ between an init checkpoint and the configured draft without changing the model.
+_INIT_FROM_IGNORED_CONFIG_KEYS = ("architectures", "dtype", "torch_dtype", "transformers_version", "_name_or_path")
+
+
+def load_init_draft_model(
+    *,
+    init_checkpoint_dir: str,
+    draft_model,
+    device,
+    precision_dtype,
+):
+    """train.init_from: start a NEW run from another run's draft weights only (no optimizer, step, LR schedule or
+    sampler state). The checkpoint's config must equal the configured draft's on every saved key, so a warm start
+    cannot silently change the drafter (block size, taps, mask layout, shape)."""
+    import json
+
+    config_path = os.path.join(init_checkpoint_dir, "config.json")
+    if not os.path.isfile(config_path):
+        raise FileNotFoundError(f"train.init_from={init_checkpoint_dir!r} has no config.json")
+    with open(config_path, encoding="utf-8") as handle:
+        saved = json.load(handle)
+    current = draft_model.config.to_dict()
+    diffs = {
+        key: (saved[key], current.get(key, "<missing>"))
+        for key in saved
+        if key not in _INIT_FROM_IGNORED_CONFIG_KEYS and saved[key] != current.get(key, "<missing>")
+    }
+    if diffs:
+        raise ValueError(
+            f"train.init_from={init_checkpoint_dir!r}: draft config differs from the configured draft "
+            f"(key: (checkpoint, configured)): {diffs}"
+        )
+    init_model = type(draft_model).from_pretrained(
+        init_checkpoint_dir,
+        dtype=precision_dtype,
+        attn_implementation=str(draft_model.config._attn_implementation),
+    )
+    init_model = init_model.to(device=device, dtype=precision_dtype)
+    init_model.set_embedding_head_trainable(False)
+    return init_model
+
+
 def load_resume_draft_model(
     *,
     resume_checkpoint_dir: str,
