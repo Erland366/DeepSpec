@@ -329,6 +329,8 @@ class BaseTrainer:
                 micro_batches_per_epoch=self.micro_batches_per_epoch,
             )
             self.next_micro_step = resume_state.next_micro_step
+            if self.args.train.get("reschedule"):
+                self._reschedule_cosine()
         elif init_from:
             print_on_local_main(f"Training step 0 of a new run from the weights of {init_from}.")
         else:
@@ -339,6 +341,24 @@ class BaseTrainer:
                 f"{self.checkpoint_dir_root} is at step {self.global_step}; run the earlier rounds first."
             )
         self.info_board()
+
+    def _reschedule_cosine(self):
+        """train.reschedule: after a resume, end the cosine at the NEW train.max_train_steps instead of the restored
+        total. The cosine is stepped recursively, so the LR continues from its current value without a jump and
+        reaches eta_min exactly at the new total. Warmup must be over."""
+        sched = self.optimizer.scheduler
+        warmup = int(sched.warmup_epochs)
+        new_t_max = int(self.max_train_steps) - warmup
+        assert self.global_step >= warmup, f"train.reschedule during warmup (step {self.global_step} < {warmup})"
+        assert new_t_max > self.global_step - warmup, (
+            f"train.reschedule: new total {self.max_train_steps} is not after the current step {self.global_step}"
+        )
+        old_t_max = int(sched.after_scheduler.T_max)
+        sched.after_scheduler.T_max = new_t_max
+        print_on_local_main(
+            f"train.reschedule: cosine total {old_t_max + warmup} -> {self.max_train_steps} steps at step "
+            f"{self.global_step} (lr now {self.optimizer.get_learning_rate():.3e})"
+        )
 
     def _set_schedule(self, *, dataset_size: int):
         (
