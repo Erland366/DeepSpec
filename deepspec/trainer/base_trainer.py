@@ -161,20 +161,25 @@ def _resolve_round(*, round_cfg, steps_per_epoch: int, max_train_steps: int, dat
     [start_step, stop_step) on this launch's cache (a chunk group), with the LR schedule of the whole run
     (train.max_train_steps = total over all rounds). The round makes whole passes over its cache, the first with the
     cache's epoch-`sampler_epoch` shuffle (seed + epoch), the next with sampler_epoch + 1, and so on; num_samples
-    must equal the cache size the round was planned for."""
+    must equal the cache size the round was planned for.
+    With partial = true (a chunk planned before it was extracted) the round trains its fixed step count on whatever
+    the cache holds: num_samples is not checked and the round need not be whole passes (the sampler streams on into
+    the next shuffle, or stops part-way through one)."""
     if round_cfg is None:
         return None
     resolved = {key: int(round_cfg[key]) for key in ("start_step", "stop_step", "sampler_epoch", "num_samples")}
+    resolved["partial"] = bool(round_cfg.get("partial", False))
     assert 0 <= resolved["start_step"] < resolved["stop_step"] <= int(max_train_steps), (
         f"train.round must satisfy 0 <= start_step < stop_step <= max_train_steps={max_train_steps}: {resolved}"
     )
-    assert resolved["num_samples"] == int(dataset_size), (
-        f"train.round was planned for {resolved['num_samples']} samples but the cache has {dataset_size}: {resolved}"
-    )
-    assert (resolved["stop_step"] - resolved["start_step"]) % int(steps_per_epoch) == 0, (
-        f"train.round spans {resolved['stop_step'] - resolved['start_step']} steps, not whole passes of "
-        f"{steps_per_epoch} steps over its cache: {resolved}"
-    )
+    if not resolved["partial"]:
+        assert resolved["num_samples"] == int(dataset_size), (
+            f"train.round was planned for {resolved['num_samples']} samples but the cache has {dataset_size}: {resolved}"
+        )
+        assert (resolved["stop_step"] - resolved["start_step"]) % int(steps_per_epoch) == 0, (
+            f"train.round spans {resolved['stop_step'] - resolved['start_step']} steps, not whole passes of "
+            f"{steps_per_epoch} steps over its cache: {resolved}"
+        )
     assert resolved["sampler_epoch"] >= 0
     return resolved
 
@@ -191,7 +196,7 @@ def _resolve_rounds(*, rounds_cfg, max_train_steps):
         cache_dirs = cfg["cache_dirs"]
         cache_dirs = [str(d) for d in cache_dirs] if isinstance(cache_dirs, (list, tuple)) else [str(cache_dirs)]
         rounds.append(dict({key: int(cfg[key]) for key in ("start_step", "stop_step", "sampler_epoch", "num_samples")},
-                           cache_dirs=cache_dirs))
+                           cache_dirs=cache_dirs, partial=bool(cfg.get("partial", False))))
     assert rounds, "train.rounds is empty"
     expected_start = 0
     for index, rnd in enumerate(rounds):
