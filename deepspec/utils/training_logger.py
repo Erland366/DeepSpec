@@ -37,12 +37,24 @@ def init(
         # Requested W&B logging must not silently degrade: a missing package or login fails here, before training.
         import wandb
 
-        if not wandb.login(anonymous="never", verify=True):
+        # The API-key check goes through a slow proxy on the MI210 nodes (2026-10-20: read timeout at the default
+        # 20 s): retry with a longer timeout, still failing loudly after the last attempt.
+        for attempt in range(1, 6):
+            try:
+                ok = wandb.login(anonymous="never", verify=True, timeout=120)
+                break
+            except Exception as exc:  # network timeouts surface as wandb AuthenticationError
+                if attempt == 5:
+                    raise
+                print(f"W&B login attempt {attempt} failed ({type(exc).__name__}: {exc}); retrying in 30 s", flush=True)
+                time.sleep(30)
+        if not ok:
             raise RuntimeError("W&B logging requested (logging.wandb_project) but this node is not logged in")
         # wandb_id: one W&B run shared by several launches (chunk rounds), resumed in place; steps stay global.
         resume_kwargs = dict(id=str(wandb_id), resume="allow") if wandb_id else {}
         _wandb_run = wandb.init(
-            project=wandb_project, entity=wandb_entity, name=wandb_name, config=config, **resume_kwargs
+            project=wandb_project, entity=wandb_entity, name=wandb_name, config=config,
+            settings=wandb.Settings(init_timeout=300), **resume_kwargs
         )
 
 
