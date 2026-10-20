@@ -384,6 +384,10 @@ class BaseTrainer:
         )
 
     def _activate_round(self, index: int, rnd):
+        # Each round boundary saves a checkpoint (full-state gathers) and builds a new dataloader; return the cached
+        # blocks so the next FSDP unshard (~10 GiB) does not fail on a fragmented cache (E9 2026-10-20: GPU OOM after
+        # 30 one-chunk rounds with 16 GiB reserved but unallocated).
+        torch.cuda.empty_cache()
         waited = _wait_for_cache_dirs(
             rnd["cache_dirs"], timeout_s=float(self.args.data.get("round_wait_timeout_s", 6 * 3600))
         )
